@@ -1,2 +1,0 @@
-[langextract.providers]
-vllm = langextract_vllm.provider:VLLMLanguageModel

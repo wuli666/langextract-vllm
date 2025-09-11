@@ -78,6 +78,52 @@ result = lx.extract(
 )
 ```
 
+### Multi-GPU Configuration
+
+For large models or high throughput scenarios, you can distribute the model across multiple GPUs:
+
+```python
+import langextract as lx
+
+config = lx.factory.ModelConfig(
+    model_id="vllm:meta-llama/Llama-2-70b-chat-hf",
+    provider="VLLMLanguageModel",
+    provider_kwargs=dict(
+        temperature=0.7,
+        top_p=0.9,
+        max_tokens=2048,
+        # Multi-GPU configuration
+        tensor_parallel_size=4,  # Distribute across 4 GPUs
+        gpu_memory_utilization=0.8,
+        max_model_len=4096,
+        # Optimize for multi-GPU setup
+        disable_custom_all_reduce=True,
+        enforce_eager=True,
+        max_workers=8,  # Higher batch size for better GPU utilization
+    ),
+)
+
+model = lx.factory.create_model(config)
+
+# Process multiple documents in parallel
+results = []
+documents = ["Document 1", "Document 2", "Document 3", ...]
+
+for doc in documents:
+    result = lx.extract(
+        model=model,
+        text_or_documents=doc,
+        prompt_description="Extract key information",
+        examples=[...],
+    )
+    results.append(result)
+```
+
+**Multi-GPU Parameters:**
+- `tensor_parallel_size`: Number of GPUs to use (must be power of 2: 1, 2, 4, 8)
+- `pipeline_parallel_size`: Pipeline parallelism degree (advanced feature)
+- `disable_custom_all_reduce=True`: Recommended for multi-GPU stability
+
 ### Using Local Models
 
 ```python
@@ -111,6 +157,8 @@ model = lx.factory.create_model(config)
 | `max_workers` | int | 1 | Maximum parallel workers |
 | `enforce_eager` | bool | True | Disable torch.compile for stability |
 | `disable_custom_all_reduce` | bool | True | Disable custom all-reduce operations |
+| `tensor_parallel_size` | int | 1 | Number of GPUs for tensor parallelism (1, 2, 4, 8) |
+| `pipeline_parallel_size` | int | 1 | Number of GPUs for pipeline parallelism |
 
 Additional vLLM engine parameters can be passed through `provider_kwargs`. Refer to the [vLLM documentation](https://docs.vllm.ai/) for complete parameter reference.
 
@@ -126,11 +174,17 @@ Additional vLLM engine parameters can be passed through `provider_kwargs`. Refer
 - Use `disable_custom_all_reduce=True` for multi-GPU setups
 - Batch multiple requests for better throughput
 
+### Multi-GPU Optimization
+- Use `tensor_parallel_size` for large models that don't fit on single GPU
+- Ensure GPU memory is balanced across all devices
+- Set `tensor_parallel_size` to power of 2 (1, 2, 4, 8)
+- Increase `max_workers` proportionally to GPU count for better utilization
+
 ## Requirements
 
 - Python >= 3.10
 - CUDA-compatible GPU (for GPU acceleration)
-- vLLM >= 0.2.0
+- vLLM >= 0.5.0
 - PyTorch >= 2.0.0
 - Transformers >= 4.30.0
 

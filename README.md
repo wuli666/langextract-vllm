@@ -124,24 +124,45 @@ for doc in documents:
 - `pipeline_parallel_size`: Pipeline parallelism degree (advanced feature)
 - `disable_custom_all_reduce=True`: Recommended for multi-GPU stability
 
-### Using Local Models
+### Using Local vLLM Server
+
+Connect to a locally running vLLM server:
 
 ```python
 import langextract as lx
 
+# First, start your vLLM server:
+# python -m vllm.entrypoints.openai.api_server \
+#     --model meta-llama/Llama-2-7b-chat-hf \
+#     --host 0.0.0.0 \
+#     --port 8000
+
 config = lx.factory.ModelConfig(
-    model_id="vllm:/path/to/your/local/model",
-    provider="VLLMLanguageModel",
+    model_id="vllm:http://localhost:8000/v1",
+    provider="VLLMLanguageModel", 
     provider_kwargs=dict(
         temperature=0.7,
         max_tokens=1024,
-        gpu_memory_utilization=0.6,
-        max_model_len=2048,
+        # Server connection settings
+        timeout=60.0,
     ),
 )
 
 model = lx.factory.create_model(config)
+
+result = lx.extract(
+    model=model,
+    text_or_documents="Your input text",
+    prompt_description="Extract information",
+    examples=[...],
+)
 ```
+
+**Local Server Benefits:**
+- Decouple model serving from client applications
+- Share one model instance across multiple clients
+- Better resource management and scaling
+- Easier deployment in production environments
 
 ## Configuration Parameters
 
@@ -159,6 +180,8 @@ model = lx.factory.create_model(config)
 | `disable_custom_all_reduce` | bool | True | Disable custom all-reduce operations |
 | `tensor_parallel_size` | int | 1 | Number of GPUs for tensor parallelism (1, 2, 4, 8) |
 | `pipeline_parallel_size` | int | 1 | Number of GPUs for pipeline parallelism |
+| `api_key` | str | None | API key for server connection (use "EMPTY" for vLLM) |
+| `timeout` | float | 60.0 | Request timeout in seconds for server connections |
 
 Additional vLLM engine parameters can be passed through `provider_kwargs`. Refer to the [vLLM documentation](https://docs.vllm.ai/) for complete parameter reference.
 

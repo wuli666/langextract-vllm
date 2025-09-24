@@ -20,14 +20,24 @@ except Exception:
     LLM = None  # type: ignore
     SamplingParams = None  # type: ignore
 
+# For API server support
+try:
+    import openai
+except Exception:
+    openai = None  # type: ignore
+
 
 @lx.providers.registry.register(*VLLM_PATTERNS, priority=20)
 class VLLMLanguageModel(base_model.BaseLanguageModel):
-    """Minimal direct vLLM integration.
+    """vLLM integration with local engine and API server support.
+
+    Supported model_id patterns:
+      - "vllm:model_name" -> Local vLLM engine (default)
+      - "vllm:http://host:port/v1" or "vllm:https://host:port/v1" -> vLLM API server
 
     Features:
       - Plain string or messages input
-      - True batching (single vLLM generate call)
+      - True batching (single vLLM generate call for local, batch API calls for server)
       - SamplingParams passthrough/override
       - Auto/custom stop tokens
       - Minimal JSON cleaning (opt-in via return_json=True)
@@ -45,11 +55,6 @@ class VLLMLanguageModel(base_model.BaseLanguageModel):
         max_model_len: int = 1024,
         **kwargs: Any,
     ):
-        if LLM is None or SamplingParams is None:
-            raise exceptions.InferenceConfigError(
-                "vLLM is not installed. Please run: pip install vllm"
-            )
-
         super().__init__()
 
         self.model_id = model_id
@@ -58,9 +63,62 @@ class VLLMLanguageModel(base_model.BaseLanguageModel):
         # Normalize model id ("vllm:foo/bar" -> "foo/bar")
         actual_model_id = model_id.split(":", 1)[1] if model_id.startswith("vllm:") else model_id
 
+        # Check if this is an API server URL
+        self.is_api_server = actual_model_id.startswith(("http://", "https://"))
+
+        if self.is_api_server:
+            self._initialize_api_client(actual_model_id, temperature, top_p, max_tokens, **kwargs)
+        else:
+            self._initialize_local_engine(actual_model_id, temperature, top_p, max_tokens, gpu_memory_utilization, max_model_len, **kwargs)
+
+    def _initialize_api_client(self, base_url: str, temperature: float, top_p: float, max_tokens: int, **kwargs: Any):
+        """Initialize OpenAI-compatible API client for vLLM server."""
+        if openai is None:
+            raise exceptions.InferenceConfigError(
+                "OpenAI package is required for API server mode. Please run: pip install openai"
+            )
+
+        self._client = openai.OpenAI(
+            base_url=base_url,
+            api_key="dummy",  # vLLM doesn't require real API key
+        )
+
+        # Get available models from the server
+        try:
+            models_response = self._client.models.list()
+            available_models = [model.id for model in models_response.data]
+            if available_models:
+                self._model_name = available_models[0]  # Use the first available model
+                logger.info(f"Using model: {self._model_name} (available: {available_models})")
+            else:
+                raise exceptions.InferenceConfigError("No models available on the VLLM server")
+        except Exception as e:
+            logger.warning(f"Failed to get models from server, using 'dummy': {e}")
+            self._model_name = "dummy"  # Fallback
+
+        # Store API parameters
+        self._api_params = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+        }
+
+        # Filter out vLLM-specific params for API mode
+        api_compatible_params = {"temperature", "top_p", "max_tokens", "stop", "seed"}
+        for k, v in kwargs.items():
+            if k in api_compatible_params:
+                self._api_params[k] = v
+
+    def _initialize_local_engine(self, actual_model_id: str, temperature: float, top_p: float, max_tokens: int, gpu_memory_utilization: float, max_model_len: int, **kwargs: Any):
+        """Initialize local vLLM engine."""
+        if LLM is None or SamplingParams is None:
+            raise exceptions.InferenceConfigError(
+                "vLLM is not installed. Please run: pip install vllm"
+            )
+
         # Split kwargs into engine kwargs vs SamplingParams overrides
         sampling_keys = self._sampling_param_names()
-        engine_block = {"temperature", "top_p", "max_tokens", "gpu_memory_utilization", "max_model_len", "stop"}
+        engine_block = {"temperature", "top_p", "max_tokens", "gpu_memory_utilization", "max_model_len", "stop", "timeout"}
         sampling_overrides = {k: v for k, v in kwargs.items() if k in sampling_keys}
         engine_kwargs = {k: v for k, v in kwargs.items() if k not in sampling_keys and k not in engine_block}
 
@@ -193,41 +251,57 @@ class VLLMLanguageModel(base_model.BaseLanguageModel):
         return self._apply_template(msgs)
 
     def _clean_json_min(self, text: str) -> str:
-        """Minimal JSON fix (only when return_json=True)."""
+        """Extract and fix JSON from model output, add markers if needed."""
         t = text.strip()
-        # 1) Already valid
+
+        # 1) Try the text as-is first
         try:
-            json.loads(t)
+            parsed = json.loads(t)
+            # If it's valid JSON, wrap it with markers for langextract
+            if isinstance(parsed, dict) and 'extractions' in parsed:
+                return f"```json\n{t}\n```"
             return t
         except Exception:
             pass
-        # 2) Close unmatched top-level '{' braces
-        if t.startswith("{") and not t.endswith("}"):
-            open_n, close_n = t.count("{"), t.count("}")
-            if open_n > close_n:
-                t2 = t + ("}" * (open_n - close_n))
+
+        # 2) Find JSON content - look for { or [ and extract from there
+        json_start = -1
+        for i, char in enumerate(t):
+            if char in '{[':
+                json_start = i
+                break
+
+        if json_start >= 0:
+            # Find the matching closing brace/bracket
+            extracted = t[json_start:]
+
+            # Try to extract a complete JSON object/array
+            for end_pos in range(len(extracted), 0, -1):
+                candidate = extracted[:end_pos].rstrip()
                 try:
-                    json.loads(t2)
-                    return t2
+                    parsed = json.loads(candidate)
+                    # If valid and contains extractions, wrap with markers
+                    if isinstance(parsed, dict) and 'extractions' in parsed:
+                        return f"```json\n{candidate}\n```"
+                    return candidate
                 except Exception:
-                    return t
-        # 3) Remove trailing commas before '}' or ']'
-        if t.startswith("{") and t.endswith("}"):
-            lines = t.split("\n")
-            cleaned = []
-            for i, line in enumerate(lines):
-                s = line.rstrip()
-                if i < len(lines) - 1:
-                    nxt = lines[i + 1].lstrip()
-                    if s.endswith(",") and (nxt.startswith("}") or nxt.startswith("]")):
-                        s = s[:-1]
-                cleaned.append(s)
-            t2 = "\n".join(cleaned)
-            try:
-                json.loads(t2)
-                return t2
-            except Exception:
-                return t
+                    continue
+
+            # If no valid JSON found, try some basic fixes
+            # Close unmatched braces
+            if extracted.startswith("{"):
+                open_n, close_n = extracted.count("{"), extracted.count("}")
+                if open_n > close_n:
+                    fixed = extracted + ("}" * (open_n - close_n))
+                    try:
+                        parsed = json.loads(fixed)
+                        if isinstance(parsed, dict) and 'extractions' in parsed:
+                            return f"```json\n{fixed}\n```"
+                        return fixed
+                    except Exception:
+                        pass
+
+        # 3) Last resort - return original text
         return t
 
     def _generate_batch(self, prompts: List[str], sampling: SamplingParams) -> List[str]:
@@ -239,6 +313,26 @@ class VLLMLanguageModel(base_model.BaseLanguageModel):
                 results.append("")
             else:
                 results.append(out.outputs[0].text)
+        return results
+
+    def _generate_batch_api(self, prompts: List[str], **kwargs: Any) -> List[str]:
+        """Generate using API server (individual API calls)."""
+        results: List[str] = []
+        params = dict(self._api_params)
+        params.update(kwargs)
+
+        for prompt in prompts:
+            try:
+                response = self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    **params
+                )
+                content = response.choices[0].message.content or ""
+                results.append(content)
+            except Exception as e:
+                raise exceptions.InferenceRuntimeError(f"API server error: {type(e).__name__}: {e}", original=e) from e
+
         return results
 
     # -------------------------
@@ -262,32 +356,66 @@ class VLLMLanguageModel(base_model.BaseLanguageModel):
         Yields:
             For each input, yields a list with a single ScoredOutput.
         """
-        # Merge per-call SamplingParams overrides
-        if kwargs:
-            valid = self._sampling_param_names()
-            ov = {k: v for k, v in kwargs.items() if k in valid}
-            if ov:
-                cur = {k: getattr(self._sampling, k, None) for k in valid}
-                cur.update(ov)
-                cur.setdefault("stop", getattr(self._sampling, "stop", None))
-                cur.setdefault("skip_special_tokens", getattr(self._sampling, "skip_special_tokens", True))
-                self._sampling = self._build_sampling(cur)
-
         do_json = bool(kwargs.get("return_json", False))
 
         # Format inputs
         try:
-            formatted = [self._format_one(p) for p in batch_prompts]
+            if self.is_api_server:
+                # For API mode, we need simpler formatting since we don't have tokenizer
+                formatted = []
+                for p in batch_prompts:
+                    if isinstance(p, str):
+                        if self.system_prompt:
+                            # Simple concatenation for API mode
+                            formatted.append(f"{self.system_prompt}\n\n{p}")
+                        else:
+                            formatted.append(p)
+                    else:
+                        # Handle messages format - simple concatenation
+                        parts = []
+                        if self.system_prompt:
+                            parts.append(f"system: {self.system_prompt}")
+                        for msg in p:
+                            role = msg.get("role", "user")
+                            content = msg.get("content", "")
+                            parts.append(f"{role}: {content}")
+                        formatted.append("\n".join(parts))
+            else:
+                formatted = [self._format_one(p) for p in batch_prompts]
         except Exception as e:
             raise exceptions.InferenceConfigError(f"Failed to format prompts: {type(e).__name__}: {e}") from e
 
         # Generate
         try:
-            texts = self._generate_batch(formatted, self._sampling)
+            if self.is_api_server:
+                # Prepare API parameters
+                api_kwargs = {}
+                api_compatible_params = {"temperature", "top_p", "max_tokens", "stop", "seed"}
+                for k, v in kwargs.items():
+                    if k in api_compatible_params:
+                        api_kwargs[k] = v
+                texts = self._generate_batch_api(formatted, **api_kwargs)
+            else:
+                # Merge per-call SamplingParams overrides for local engine
+                if kwargs:
+                    valid = self._sampling_param_names()
+                    ov = {k: v for k, v in kwargs.items() if k in valid}
+                    if ov:
+                        cur = {k: getattr(self._sampling, k, None) for k in valid}
+                        cur.update(ov)
+                        cur.setdefault("stop", getattr(self._sampling, "stop", None))
+                        cur.setdefault("skip_special_tokens", getattr(self._sampling, "skip_special_tokens", True))
+                        self._sampling = self._build_sampling(cur)
+                texts = self._generate_batch(formatted, self._sampling)
         except Exception as e:
-            raise exceptions.InferenceRuntimeError(f"vLLM engine error: {type(e).__name__}: {e}", original=e) from e
+            error_type = "API server" if self.is_api_server else "vLLM engine"
+            raise exceptions.InferenceRuntimeError(f"{error_type} error: {type(e).__name__}: {e}", original=e) from e
 
         # Yield results
         for t in texts:
-            out = self._clean_json_min(t) if do_json else t
+            # Always try to clean/extract JSON if it looks like we need structured output
+            if do_json or ('{' in t or '[' in t):
+                out = self._clean_json_min(t)
+            else:
+                out = t
             yield [types.ScoredOutput(score=1.0, output=out)]
